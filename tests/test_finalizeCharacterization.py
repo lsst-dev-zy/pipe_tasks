@@ -63,6 +63,7 @@ class MockFinalizeCharacterizationTask(FinalizeCharacterizationTask):
     def __init__(self, **kwargs):
         pipeBase.PipelineTask.__init__(self, **kwargs)
 
+        self._deferred_get_cache = {}
         self.makeSubtask('reserve_selection')
         self.makeSubtask('source_selector')
 
@@ -90,6 +91,7 @@ class MockFinalizeCharacterizationDetectorTask(FinalizeCharacterizationDetectorT
     def __init__(self, **kwargs):
         pipeBase.PipelineTask.__init__(self, **kwargs)
 
+        self._deferred_get_cache = {}
         self.makeSubtask('reserve_selection')
         self.makeSubtask('source_selector')
 
