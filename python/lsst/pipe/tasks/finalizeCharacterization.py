@@ -812,7 +812,7 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
         merge_cat_counter = 0
         merge_source_counter = 0
 
-        handle = isolated_star_cat_dict[list(isolated_star_cat_dict.keys())[0]]
+        handle = isolated_star_source_dict[list(isolated_star_source_dict.keys())[0]]
         all_source_columns = self._cached_handle_get(handle, component='columns')
         source_columns = [self.config.id_column, 'obj_index']
         # visit can be used if it is in the input catalog.
