@@ -45,6 +45,7 @@ from lsst.geom import LinearTransform
 import lsst.pex.config as pexConfig
 import lsst.pipe.base as pipeBase
 import lsst.daf.base as dafBase
+from lsst.daf.butler import DeferredDatasetHandle
 import lsst.afw.table as afwTable
 from lsst.afw.geom import Quadrupole
 import lsst.meas.algorithms as measAlg
@@ -1518,9 +1519,9 @@ class FinalizeCharacterizationDetectorTask(FinalizeCharacterizationTaskBase):
         else:
             fgcm_standard_star_cat = None
 
-        if hasattr(src, "get"):
+        if isinstance(src, DeferredDatasetHandle):
             src = src.get()
-        if hasattr(exposure, "get"):
+        if isinstance(exposure, DeferredDatasetHandle):
             exposure = exposure.get()
 
         psf, ap_corr_map, measured_src = self.compute_psf_and_ap_corr_map(
