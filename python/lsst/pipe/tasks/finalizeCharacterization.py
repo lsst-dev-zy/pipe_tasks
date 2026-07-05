@@ -577,7 +577,8 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
         """Make a cache key for a deferred-handle read."""
         dataset_id = getattr(getattr(handle, "ref", None), "id", None)
         if dataset_id is None:
-            dataset_id = repr(getattr(handle, "dataId", handle))
+            data_id = getattr(handle, "dataId", None)
+            dataset_id = repr(data_id) if data_id else id(handle)
 
         return (
             dataset_id,
