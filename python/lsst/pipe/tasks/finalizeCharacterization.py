@@ -193,6 +193,19 @@ class FinalizeCharacterizationConfigBase(
         dtype=str,
         default='sourceId',
     )
+    do_probe_isolated_star_source_columns = pexConfig.Field(
+        dtype=bool,
+        default=False,
+        doc=("Probe isolated_star_sources columns before reading.  This supports older "
+             "inputs that may not have visit/detector columns, but adds an expensive "
+             "extra parquet metadata read for every quantum."),
+    )
+    isolated_star_visit_cache_size = pexConfig.Field(
+        dtype=int,
+        default=1,
+        doc=("Maximum number of visit-level isolated-star merges to cache in one "
+             "Python process. Set to 0 to disable this cache."),
+    )
     reserve_selection = pexConfig.ConfigurableField(
         target=ReserveIsolatedStarsTask,
         doc='Task to select reserved stars',
@@ -350,6 +363,7 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
     """Run final characterization on exposures."""
     ConfigClass = FinalizeCharacterizationConfigBase
     _DefaultName = 'finalize_characterization_base'
+    _visit_level_cache = {}
 
     def __init__(self, initInputs=None, **kwargs):
         super().__init__(initInputs=initInputs, **kwargs)
@@ -612,6 +626,86 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
 
         return self._copy_cached_value(self._deferred_get_cache[key])
 
+    def _visit_level_cache_key(
+        self,
+        band,
+        visit,
+        isolated_star_cat_dict,
+        isolated_star_source_dict,
+        fgcm_standard_star_dict=None,
+    ):
+        """Make a cache key for a visit-level isolated-star merge."""
+        cat_keys = tuple(
+            (tract, self._handle_cache_key(handle))
+            for tract, handle in sorted(isolated_star_cat_dict.items())
+        )
+        source_keys = tuple(
+            (tract, self._handle_cache_key(handle))
+            for tract, handle in sorted(isolated_star_source_dict.items())
+        )
+        if fgcm_standard_star_dict is None:
+            fgcm_keys = None
+        else:
+            fgcm_keys = tuple(
+                (tract, self._handle_cache_key(handle))
+                for tract, handle in sorted(fgcm_standard_star_dict.items())
+            )
+        return (
+            visit,
+            band,
+            cat_keys,
+            source_keys,
+            fgcm_keys,
+        )
+
+    @staticmethod
+    def _copy_cached_tables(isolated_table, isolated_source_table):
+        """Copy cached astropy tables before handing them to task code."""
+        if isolated_table is not None:
+            isolated_table = isolated_table.copy(copy_data=True)
+        if isolated_source_table is not None:
+            isolated_source_table = isolated_source_table.copy(copy_data=True)
+        return isolated_table, isolated_source_table
+
+    def _cached_visit_level_isolated_star_cats(
+        self,
+        band,
+        isolated_star_cat_dict,
+        isolated_star_source_dict,
+        visit,
+        fgcm_standard_star_dict=None,
+    ):
+        """Return a cached visit-level merge of isolated-star catalogs.
+
+        This caches the full visit merge before detector down-selection so
+        repeated detector quanta for the same visit can reuse the same merged
+        tract reads when they execute in the same Python process.
+        """
+        key = self._visit_level_cache_key(
+            band,
+            visit,
+            isolated_star_cat_dict,
+            isolated_star_source_dict,
+            fgcm_standard_star_dict=fgcm_standard_star_dict,
+        )
+        if self.config.isolated_star_visit_cache_size <= 0:
+            return self.concat_isolated_star_cats(
+                band,
+                isolated_star_cat_dict,
+                isolated_star_source_dict,
+                visit=visit,
+            )
+        if key not in self._visit_level_cache:
+            while len(self._visit_level_cache) >= self.config.isolated_star_visit_cache_size:
+                self._visit_level_cache.pop(next(iter(self._visit_level_cache)))
+            self._visit_level_cache[key] = self.concat_isolated_star_cats(
+                band,
+                isolated_star_cat_dict,
+                isolated_star_source_dict,
+                visit=visit,
+            )
+        return self._copy_cached_tables(*self._visit_level_cache[key])
+
     def _make_selection_schema_mapper(self, input_schema):
         """Make the schema mapper from the input schema to the selection schema.
 
@@ -814,18 +908,23 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
         merge_cat_counter = 0
         merge_source_counter = 0
 
-        handle = isolated_star_source_dict[list(isolated_star_source_dict.keys())[0]]
-        all_source_columns = self._cached_handle_get(handle, component='columns')
         source_columns = [self.config.id_column, 'obj_index']
-        # visit can be used if it is in the input catalog.
-        if visit is not None and 'visit' in all_source_columns:
-            source_columns.append('visit')
-            if detector is not None and 'detector' in all_source_columns:
-                source_columns.append('detector')
-            else:
+
+        if self.config.do_probe_isolated_star_source_columns:
+            handle = isolated_star_source_dict[list(isolated_star_source_dict.keys())[0]]
+            all_source_columns = self._cached_handle_get(handle, component='columns')
+            if visit is not None and 'visit' not in all_source_columns:
+                visit = None
                 detector = None
+            if visit is not None and 'detector' not in all_source_columns:
+                detector = None
+
+        # Avoid probing parquet metadata in the common case: current
+        # isolated_star_sources inputs are expected to carry visit/detector.
+        if visit is not None:
+            source_columns.append('visit')
+            source_columns.append('detector')
         else:
-            visit = None
             detector = None
 
         for tract in isolated_star_cat_dict:
@@ -1317,9 +1416,10 @@ class FinalizeCharacterizationTask(FinalizeCharacterizationTaskBase):
         else:
             detector_keys = sorted(src_detectors)
 
-        # We do not need the isolated star table in this task.
-        # However, it is used in tests to confirm consistency of indexes.
-        _, isolated_source_table = self.concat_isolated_star_cats(
+        # Build a visit-level merge once, then filter down to this detector in
+        # memory.  This avoids repeating the tract-level WebDAV reads for every
+        # detector quantum when the same visit is processed in one worker.
+        _, isolated_source_table = self._cached_visit_level_isolated_star_cats(
             band,
             isolated_star_cat_dict,
             isolated_star_source_dict,
@@ -1483,15 +1583,20 @@ class FinalizeCharacterizationDetectorTask(FinalizeCharacterizationTaskBase):
         NoWorkFound
             Raised if the selector returns no good sources.
         """
-        # We do not need the isolated star table in this task.
-        # However, it is used in tests to confirm consistency of indexes.
-        _, isolated_source_table = self.concat_isolated_star_cats(
+        # Build a visit-level merge once, then filter down to this detector in
+        # memory.  This avoids repeating the tract-level WebDAV reads for every
+        # detector quantum when the same visit is processed in one worker.
+        _, isolated_source_table = self._cached_visit_level_isolated_star_cats(
             band,
             isolated_star_cat_dict,
             isolated_star_source_dict,
             visit=visit,
-            detector=detector,
         )
+
+        if isolated_source_table is not None and 'detector' in isolated_source_table.colnames:
+            isolated_source_table = isolated_source_table[isolated_source_table['detector'] == detector]
+        if isolated_source_table is not None and len(isolated_source_table) == 0:
+            isolated_source_table = None
 
         if isolated_source_table is None:
             raise pipeBase.NoWorkFound(f'No good isolated sources found for any detectors in visit {visit}')
