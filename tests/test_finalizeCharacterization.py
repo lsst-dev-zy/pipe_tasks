@@ -35,7 +35,6 @@ import lsst.pipe.base as pipeBase
 
 from lsst.pipe.tasks.finalizeCharacterization import (
     FinalizeCharacterizationConfig,
-    FinalizeCharacterizationTaskBase,
     FinalizeCharacterizationTask,
     FinalizeCharacterizationDetectorConfig,
     FinalizeCharacterizationDetectorTask,
@@ -64,7 +63,6 @@ class MockFinalizeCharacterizationTask(FinalizeCharacterizationTask):
     def __init__(self, **kwargs):
         pipeBase.PipelineTask.__init__(self, **kwargs)
 
-        self._deferred_get_cache = {}
         self.makeSubtask('reserve_selection')
         self.makeSubtask('source_selector')
 
@@ -92,7 +90,6 @@ class MockFinalizeCharacterizationDetectorTask(FinalizeCharacterizationDetectorT
     def __init__(self, **kwargs):
         pipeBase.PipelineTask.__init__(self, **kwargs)
 
-        self._deferred_get_cache = {}
         self.makeSubtask('reserve_selection')
         self.makeSubtask('source_selector')
 
@@ -119,7 +116,6 @@ class FinalizeCharacterizationTestCase(lsst.utils.tests.TestCase):
     managing Task execution.
     """
     def setUp(self):
-        FinalizeCharacterizationTaskBase._visit_level_cache = {}
         config = FinalizeCharacterizationConfig()
 
         self.finalizeCharacterizationTask = MockFinalizeCharacterizationTask(
@@ -158,9 +154,7 @@ class FinalizeCharacterizationTestCase(lsst.utils.tests.TestCase):
                      ('nsource_z', 'i4')]
 
         dtype_source = [('sourceId', 'i8'),
-                        ('obj_index', 'i4'),
-                        ('visit', 'i8'),
-                        ('detector', 'i4')]
+                        ('obj_index', 'i4')]
 
         dtype_fgcm = [
             ('ra', 'f8'),
@@ -224,8 +218,6 @@ class FinalizeCharacterizationTestCase(lsst.utils.tests.TestCase):
                         tract*nstar + counter + nsource_per_band_per_star
                     )
                     source_cat['obj_index'] = i
-                    source_cat['visit'] = 100
-                    source_cat['detector'] = np.arange(nsource_per_band_per_star) % 2
 
                     source_cats.append(source_cat)
 
@@ -302,50 +294,6 @@ class FinalizeCharacterizationTestCase(lsst.utils.tests.TestCase):
         )
 
         self.assertGreater(len(iso), 0)
-
-    def test_visit_level_cache(self):
-        """Test that a visit-level merge is cached and copied on reuse."""
-
-        class CacheProbeTask(MockFinalizeCharacterizationDetectorTask):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.concat_calls = 0
-
-            def concat_isolated_star_cats(self, band, isolated_star_cat_dict,
-                                          isolated_star_source_dict, visit=None, detector=None):
-                self.concat_calls += 1
-                isolated = astropy.table.table.Table()
-                isolated['isolated_star_id'] = [1]
-                isolated['reserved'] = [False]
-                isolated_source = astropy.table.table.Table()
-                isolated_source['sourceId'] = [11]
-                isolated_source['obj_index'] = [0]
-                isolated_source['visit'] = [visit]
-                isolated_source['detector'] = [7]
-                isolated_source['reserved'] = [False]
-                return isolated, isolated_source
-
-        task = CacheProbeTask(config=FinalizeCharacterizationDetectorConfig())
-        cat_dict = {0: object()}
-        src_dict = {0: object()}
-
-        first = task._cached_visit_level_isolated_star_cats(
-            'r',
-            cat_dict,
-            src_dict,
-            visit=1234,
-        )
-        second = task._cached_visit_level_isolated_star_cats(
-            'r',
-            cat_dict,
-            src_dict,
-            visit=1234,
-        )
-
-        self.assertEqual(task.concat_calls, 1)
-        self.assertIsNot(first[1], second[1])
-        np.testing.assert_array_equal(first[1]['sourceId'], second[1]['sourceId'])
-        np.testing.assert_array_equal(first[1]['detector'], second[1]['detector'])
 
     def test_compute_psf_and_ap_corr_map_no_sources(self):
         """Test log message when there are no good sources after selection."""
