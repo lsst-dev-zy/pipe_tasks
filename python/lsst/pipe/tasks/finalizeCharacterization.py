@@ -45,7 +45,6 @@ from lsst.geom import LinearTransform
 import lsst.pex.config as pexConfig
 import lsst.pipe.base as pipeBase
 import lsst.daf.base as dafBase
-from lsst.daf.butler import DeferredDatasetHandle
 import lsst.afw.table as afwTable
 from lsst.afw.geom import Quadrupole
 import lsst.meas.algorithms as measAlg
@@ -155,14 +154,12 @@ class FinalizeCharacterizationDetectorConnections(
         name='src',
         storageClass='SourceCatalog',
         dimensions=('instrument', 'visit', 'detector'),
-        deferLoad=True,
     )
     calexp = pipeBase.connectionTypes.Input(
         doc='Calibrated exposure for the visit/detector.',
         name='calexp',
         storageClass='ExposureF',
         dimensions=('instrument', 'visit', 'detector'),
-        deferLoad=True,
     )
     finalized_psf_ap_corr_detector_cat = pipeBase.connectionTypes.Output(
         doc=('Per-visit/per-detector finalized psf models and aperture corrections.  This '
@@ -192,19 +189,6 @@ class FinalizeCharacterizationConfigBase(
         doc='Name of column in isolated_star_sources with source id.',
         dtype=str,
         default='sourceId',
-    )
-    do_probe_isolated_star_source_columns = pexConfig.Field(
-        dtype=bool,
-        default=False,
-        doc=("Probe isolated_star_sources columns before reading.  This supports older "
-             "inputs that may not have visit/detector columns, but adds an expensive "
-             "extra parquet metadata read for every quantum."),
-    )
-    isolated_star_visit_cache_size = pexConfig.Field(
-        dtype=int,
-        default=1,
-        doc=("Maximum number of visit-level isolated-star merges to cache in one "
-             "Python process. Set to 0 to disable this cache."),
     )
     reserve_selection = pexConfig.ConfigurableField(
         target=ReserveIsolatedStarsTask,
@@ -363,7 +347,6 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
     """Run final characterization on exposures."""
     ConfigClass = FinalizeCharacterizationConfigBase
     _DefaultName = 'finalize_characterization_base'
-    _visit_level_cache = {}
 
     def __init__(self, initInputs=None, **kwargs):
         super().__init__(initInputs=initInputs, **kwargs)
@@ -385,12 +368,6 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
         self.isPsfDeterminerPiff = False
         if isinstance(self.psf_determiner, lsst.meas.extensions.piff.piffPsfDeterminer.PiffPsfDeterminerTask):
             self.isPsfDeterminerPiff = True
-
-        # Butler's local artifact cache is not preferred for component or
-        # parameterized parquet reads.  Cache those deferred-handle results
-        # within this task process to avoid repeated WebDAV reads when many
-        # detector quanta share the same tract-level isolated-star inputs.
-        self._deferred_get_cache = {}
 
     def _make_output_schema_mapper(self, input_schema):
         """Make the schema mapper from the input schema to the output schema.
@@ -571,141 +548,6 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
 
         return mapper, output_schema
 
-    @staticmethod
-    def _normalize_cache_key_part(value):
-        """Normalize deferred-handle get arguments for use in cache keys."""
-        if isinstance(value, dict):
-            return tuple(
-                (key, FinalizeCharacterizationTaskBase._normalize_cache_key_part(val))
-                for key, val in sorted(value.items())
-            )
-        if isinstance(value, (list, tuple)):
-            return tuple(FinalizeCharacterizationTaskBase._normalize_cache_key_part(val)
-                         for val in value)
-        if isinstance(value, set):
-            return tuple(sorted(FinalizeCharacterizationTaskBase._normalize_cache_key_part(val)
-                                for val in value))
-        return value
-
-    def _handle_cache_key(self, handle, *, component=None, parameters=None):
-        """Make a cache key for a deferred-handle read."""
-        dataset_id = getattr(getattr(handle, "ref", None), "id", None)
-        if dataset_id is None:
-            data_id = getattr(handle, "dataId", None)
-            dataset_id = repr(data_id) if data_id else id(handle)
-
-        return (
-            dataset_id,
-            component,
-            self._normalize_cache_key_part(parameters),
-        )
-
-    @staticmethod
-    def _copy_cached_value(value):
-        """Copy mutable cached values before returning them to task code."""
-        copy = getattr(value, "copy", None)
-        if copy is None:
-            return value
-
-        try:
-            return copy(copy_data=True)
-        except TypeError:
-            return copy()
-
-    def _cached_handle_get(self, handle, *, component=None, parameters=None):
-        """Read a deferred handle through a small task-local cache.
-
-        Butler's local artifact cache is bypassed for component and
-        parameterized parquet reads.  This cache avoids repeating those reads
-        inside one task process, while returning copies so callers can mutate
-        Astropy tables without corrupting cached state.
-        """
-        key = self._handle_cache_key(handle, component=component, parameters=parameters)
-        if key not in self._deferred_get_cache:
-            self._deferred_get_cache[key] = handle.get(component=component, parameters=parameters)
-
-        return self._copy_cached_value(self._deferred_get_cache[key])
-
-    def _visit_level_cache_key(
-        self,
-        band,
-        visit,
-        isolated_star_cat_dict,
-        isolated_star_source_dict,
-        fgcm_standard_star_dict=None,
-    ):
-        """Make a cache key for a visit-level isolated-star merge."""
-        cat_keys = tuple(
-            (tract, self._handle_cache_key(handle))
-            for tract, handle in sorted(isolated_star_cat_dict.items())
-        )
-        source_keys = tuple(
-            (tract, self._handle_cache_key(handle))
-            for tract, handle in sorted(isolated_star_source_dict.items())
-        )
-        if fgcm_standard_star_dict is None:
-            fgcm_keys = None
-        else:
-            fgcm_keys = tuple(
-                (tract, self._handle_cache_key(handle))
-                for tract, handle in sorted(fgcm_standard_star_dict.items())
-            )
-        return (
-            visit,
-            band,
-            cat_keys,
-            source_keys,
-            fgcm_keys,
-        )
-
-    @staticmethod
-    def _copy_cached_tables(isolated_table, isolated_source_table):
-        """Copy cached astropy tables before handing them to task code."""
-        if isolated_table is not None:
-            isolated_table = isolated_table.copy(copy_data=True)
-        if isolated_source_table is not None:
-            isolated_source_table = isolated_source_table.copy(copy_data=True)
-        return isolated_table, isolated_source_table
-
-    def _cached_visit_level_isolated_star_cats(
-        self,
-        band,
-        isolated_star_cat_dict,
-        isolated_star_source_dict,
-        visit,
-        fgcm_standard_star_dict=None,
-    ):
-        """Return a cached visit-level merge of isolated-star catalogs.
-
-        This caches the full visit merge before detector down-selection so
-        repeated detector quanta for the same visit can reuse the same merged
-        tract reads when they execute in the same Python process.
-        """
-        key = self._visit_level_cache_key(
-            band,
-            visit,
-            isolated_star_cat_dict,
-            isolated_star_source_dict,
-            fgcm_standard_star_dict=fgcm_standard_star_dict,
-        )
-        if self.config.isolated_star_visit_cache_size <= 0:
-            return self.concat_isolated_star_cats(
-                band,
-                isolated_star_cat_dict,
-                isolated_star_source_dict,
-                visit=visit,
-            )
-        if key not in self._visit_level_cache:
-            while len(self._visit_level_cache) >= self.config.isolated_star_visit_cache_size:
-                self._visit_level_cache.pop(next(iter(self._visit_level_cache)))
-            self._visit_level_cache[key] = self.concat_isolated_star_cats(
-                band,
-                isolated_star_cat_dict,
-                isolated_star_source_dict,
-                visit=visit,
-            )
-        return self._copy_cached_tables(*self._visit_level_cache[key])
-
     def _make_selection_schema_mapper(self, input_schema):
         """Make the schema mapper from the input schema to the selection schema.
 
@@ -869,6 +711,18 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
 
         return ialtalt, iazaz, ialtaz
 
+    @staticmethod
+    def _looks_like_missing_column_error(err, columns):
+        """Check if an exception looks like a missing parquet column."""
+        message = str(err)
+        message_lower = message.lower()
+        if not any(column in message for column in columns):
+            return False
+        return any(
+            marker in message_lower
+            for marker in ("column", "field", "no match")
+        )
+
     def concat_isolated_star_cats(
         self,
         band,
@@ -908,30 +762,41 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
         merge_cat_counter = 0
         merge_source_counter = 0
 
+        optional_source_columns = []
         source_columns = [self.config.id_column, 'obj_index']
-
-        if self.config.do_probe_isolated_star_source_columns:
-            handle = isolated_star_source_dict[list(isolated_star_source_dict.keys())[0]]
-            all_source_columns = self._cached_handle_get(handle, component='columns')
-            if visit is not None and 'visit' not in all_source_columns:
-                visit = None
-                detector = None
-            if visit is not None and 'detector' not in all_source_columns:
-                detector = None
-
-        # Avoid probing parquet metadata in the common case: current
-        # isolated_star_sources inputs are expected to carry visit/detector.
+        # Current isolated_star_sources inputs include visit/detector columns.
+        # Request them directly to avoid an extra parquet metadata read per quantum.
         if visit is not None:
-            source_columns.append('visit')
-            source_columns.append('detector')
+            optional_source_columns.append('visit')
+            if detector is not None:
+                optional_source_columns.append('detector')
+            source_columns.extend(optional_source_columns)
         else:
+            visit = None
             detector = None
 
         for tract in isolated_star_cat_dict:
-            astropy_source = self._cached_handle_get(
-                isolated_star_source_dict[tract],
-                parameters={'columns': source_columns}
-            )
+            astropy_cat = isolated_star_cat_dict[tract].get()
+            try:
+                astropy_source = isolated_star_source_dict[tract].get(
+                    parameters={'columns': source_columns}
+                )
+            except Exception as err:
+                if optional_source_columns and self._looks_like_missing_column_error(
+                    err,
+                    optional_source_columns,
+                ):
+                    self.log.warning(
+                        "isolated_star_sources do not provide %s; "
+                        "falling back without visit/detector down-selection.",
+                        ", ".join(optional_source_columns),
+                    )
+                    return self.concat_isolated_star_cats(
+                        band,
+                        isolated_star_cat_dict,
+                        isolated_star_source_dict,
+                    )
+                raise
 
             # Cut the isolated star sources to this visit/detector.
             sources_downselected = False
@@ -955,12 +820,6 @@ class FinalizeCharacterizationTaskBase(pipeBase.PipelineTask):
                         continue
 
                 astropy_source = astropy_source[these_sources]
-
-            # Delay reading the companion isolated-star catalog until after
-            # the cheap visit/detector source downselection. This avoids an
-            # additional tract-level parquet read for tracts that do not
-            # contribute to this detector.
-            astropy_cat = self._cached_handle_get(isolated_star_cat_dict[tract])
 
             # Cut isolated star table to those observed in this band, and adjust indexes
             # We must use all the stars in the table in the band to ensure consistent
@@ -1416,10 +1275,9 @@ class FinalizeCharacterizationTask(FinalizeCharacterizationTaskBase):
         else:
             detector_keys = sorted(src_detectors)
 
-        # Build a visit-level merge once, then filter down to this detector in
-        # memory.  This avoids repeating the tract-level WebDAV reads for every
-        # detector quantum when the same visit is processed in one worker.
-        _, isolated_source_table = self._cached_visit_level_isolated_star_cats(
+        # We do not need the isolated star table in this task.
+        # However, it is used in tests to confirm consistency of indexes.
+        _, isolated_source_table = self.concat_isolated_star_cats(
             band,
             isolated_star_cat_dict,
             isolated_star_source_dict,
@@ -1447,7 +1305,7 @@ class FinalizeCharacterizationTask(FinalizeCharacterizationTaskBase):
             fgcm_standard_star_cat = []
 
             for tract in fgcm_standard_star_dict:
-                astropy_fgcm = self._cached_handle_get(fgcm_standard_star_dict[tract])
+                astropy_fgcm = fgcm_standard_star_dict[tract].get()
                 table_fgcm = np.asarray(astropy_fgcm)
                 fgcm_standard_star_cat.append(table_fgcm)
 
@@ -1566,10 +1424,10 @@ class FinalizeCharacterizationDetectorTask(FinalizeCharacterizationTaskBase):
             Per-tract dict of isolated star catalog handles.
         isolated_star_source_dict : `dict`
             Per-tract dict of isolated star source catalog handles.
-        src : `lsst.afw.table.SourceCatalog` or `lsst.daf.butler.DeferredDatasetHandle`
-            Src catalog or deferred handle.
-        exposure : `lsst.afw.image.Exposure` or `lsst.daf.butler.DeferredDatasetHandle`
-            Calexp exposure or deferred handle.
+        src : `lsst.afw.table.SourceCatalog`
+            Src catalog.
+        exposure : `lsst.afw.image.Exposure`
+            Calexp exposure.
         fgcm_standard_star_dict : `dict`
             Per tract dict of fgcm isolated stars.
 
@@ -1583,20 +1441,15 @@ class FinalizeCharacterizationDetectorTask(FinalizeCharacterizationTaskBase):
         NoWorkFound
             Raised if the selector returns no good sources.
         """
-        # Build a visit-level merge once, then filter down to this detector in
-        # memory.  This avoids repeating the tract-level WebDAV reads for every
-        # detector quantum when the same visit is processed in one worker.
-        _, isolated_source_table = self._cached_visit_level_isolated_star_cats(
+        # We do not need the isolated star table in this task.
+        # However, it is used in tests to confirm consistency of indexes.
+        _, isolated_source_table = self.concat_isolated_star_cats(
             band,
             isolated_star_cat_dict,
             isolated_star_source_dict,
             visit=visit,
+            detector=detector,
         )
-
-        if isolated_source_table is not None and 'detector' in isolated_source_table.colnames:
-            isolated_source_table = isolated_source_table[isolated_source_table['detector'] == detector]
-        if isolated_source_table is not None and len(isolated_source_table) == 0:
-            isolated_source_table = None
 
         if isolated_source_table is None:
             raise pipeBase.NoWorkFound(f'No good isolated sources found for any detectors in visit {visit}')
@@ -1617,18 +1470,13 @@ class FinalizeCharacterizationDetectorTask(FinalizeCharacterizationTaskBase):
             fgcm_standard_star_cat = []
 
             for tract in fgcm_standard_star_dict:
-                astropy_fgcm = self._cached_handle_get(fgcm_standard_star_dict[tract])
+                astropy_fgcm = fgcm_standard_star_dict[tract].get()
                 table_fgcm = np.asarray(astropy_fgcm)
                 fgcm_standard_star_cat.append(table_fgcm)
 
             fgcm_standard_star_cat = np.concatenate(fgcm_standard_star_cat)
         else:
             fgcm_standard_star_cat = None
-
-        if isinstance(src, DeferredDatasetHandle):
-            src = src.get()
-        if isinstance(exposure, DeferredDatasetHandle):
-            exposure = exposure.get()
 
         psf, ap_corr_map, measured_src = self.compute_psf_and_ap_corr_map(
             visit,
